@@ -1,0 +1,12 @@
+node_modules/
+.pi-ghidra/
+.pi-subagents/
+test-cache/
+.audit-runtime.json
+.research-*.md
+.architecture.md
+.ghidra-api.md
+*.log
+*.gpr
+*.rep/
+.DS_Store
