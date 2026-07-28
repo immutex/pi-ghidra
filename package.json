@@ -4,6 +4,18 @@
   "description": "Autonomous headless Ghidra analysis tools for Pi",
   "type": "module",
   "license": "MIT",
+  "author": "immutex",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/immutex/pi-ghidra.git"
+  },
+  "homepage": "https://github.com/immutex/pi-ghidra#readme",
+  "bugs": {
+    "url": "https://github.com/immutex/pi-ghidra/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "keywords": [
     "pi-package",
     "ghidra",
@@ -31,7 +43,8 @@
     "check": "tsc --noEmit",
     "test": "tsx --test test/runtime.test.ts",
     "test:integration": "tsx --test test/integration.test.ts",
-    "pack:check": "npm pack --dry-run"
+    "pack:check": "npm pack --dry-run",
+    "prepublishOnly": "npm run check && npm test"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

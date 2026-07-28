@@ -29,7 +29,7 @@ pi install npm:pi-ghidra
 From Git:
 
 ```bash
-pi install git:github.com/OWNER/pi-ghidra
+pi install git:github.com/immutex/pi-ghidra
 ```
 
 Try a local checkout:
