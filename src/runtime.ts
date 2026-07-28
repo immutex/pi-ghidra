@@ -12,6 +12,7 @@ import {
 	copyFile,
 	mkdir,
 	readFile,
+	rename as renameFile,
 	rm,
 	stat,
 	utimes,
@@ -23,6 +24,8 @@ import { fileURLToPath } from "node:url";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 
 export const ACTIONS = [
+	"discover",
+	"setup",
 	"health",
 	"analyze",
 	"rebuild",
@@ -55,7 +58,7 @@ export const ACTIONS = [
 export type Action = (typeof ACTIONS)[number];
 
 export interface Operation {
-	action: Exclude<Action, "health" | "batch" | "rebuild">;
+	action: Exclude<Action, "discover" | "setup" | "health" | "batch" | "rebuild">;
 	address?: string;
 	name?: string;
 	query?: string;
@@ -76,6 +79,7 @@ export interface GhidraRequest extends Omit<Operation, "action"> {
 	binary?: string;
 	operations?: Operation[];
 	ghidraHome?: string;
+	javaHome?: string;
 	cacheDir?: string;
 	force?: boolean;
 }
@@ -99,10 +103,17 @@ interface Manifest {
 	createdAt: string;
 }
 
+export interface GhidraConfig {
+	ghidraHome?: string;
+	javaHome?: string;
+	cacheDir?: string;
+}
+
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT_DIR = join(PACKAGE_ROOT, "ghidra_scripts");
 const PROJECT_NAME = "pi-ghidra";
 const queues = new Map<string, Promise<void>>();
+let automaticHomesCache: string[] | undefined;
 const READ_ACTIONS = new Set<Action>([
 	"info",
 	"memory_blocks",
@@ -124,8 +135,52 @@ const READ_ACTIONS = new Set<Action>([
 	"analysis_options",
 ]);
 
+export function ghidraConfigPath(): string {
+	return join(
+		resolve(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent")),
+		"pi-ghidra.json",
+	);
+}
+
+export function readGhidraConfig(): GhidraConfig {
+	const path = ghidraConfigPath();
+	if (!existsSync(path)) return {};
+	try {
+		const value = JSON.parse(readFileSync(path, "utf8")) as unknown;
+		if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Expected a JSON object");
+		for (const key of ["ghidraHome", "javaHome", "cacheDir"] as const) {
+			if (key in value && typeof (value as Record<string, unknown>)[key] !== "string")
+				throw new Error(`${key} must be a string`);
+		}
+		return value as GhidraConfig;
+	} catch (error) {
+		throw new Error(`Invalid pi-ghidra configuration: ${path}`, { cause: error });
+	}
+}
+
+function readableGhidraConfig(): GhidraConfig {
+	try {
+		return readGhidraConfig();
+	} catch (error) {
+		if (error instanceof Error && error.message.startsWith("Invalid pi-ghidra configuration:")) return {};
+		throw error;
+	}
+}
+
+export function validateCacheDir(path: string): string {
+	const resolved = resolve(path);
+	const parts = resolved.split(/[\\/]+/);
+	if (parts.some((part) => part.startsWith(".")))
+		throw new Error(`Ghidra project paths cannot contain dot-prefixed directories: ${resolved}`);
+	if (parts.some((part) => /[&%!^]/.test(part)))
+		throw new Error(`Ghidra project paths cannot contain &, %, !, or ^: ${resolved}`);
+	return resolved;
+}
+
 function defaultCacheDir(): string {
-	if (process.env.PI_GHIDRA_CACHE) return resolve(process.env.PI_GHIDRA_CACHE);
+	if (process.env.PI_GHIDRA_CACHE) return validateCacheDir(process.env.PI_GHIDRA_CACHE);
+	const configured = readableGhidraConfig().cacheDir;
+	if (configured) return resolve(configured);
 	if (process.platform === "win32")
 		return join(
 			process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"),
@@ -144,79 +199,214 @@ function applicationVersion(home: string): string | undefined {
 		?.trim();
 }
 
-function candidateHomes(): string[] {
-	const values = [process.env.PI_GHIDRA_HOME, process.env.GHIDRA_HOME];
-	if (process.platform === "win32") {
-		values.push("C:\\ghidra_12.1.2");
-		for (const root of ["C:\\", process.env.USERPROFILE]) {
-			if (!root || !existsSync(root)) continue;
-			try {
-				values.push(
-					...readdirSync(root)
-						.filter((name) => /^ghidra_/i.test(name))
-						.sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))
-						.map((name) => join(root, name)),
-				);
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "EACCES") throw error;
-			}
+function launcherPath(home: string): string {
+	return join(
+		home,
+		"support",
+		process.platform === "win32" ? "analyzeHeadless.bat" : "analyzeHeadless",
+	);
+}
+
+function validateGhidraHome(home: string): string {
+	const resolved = resolve(home);
+	if (!existsSync(launcherPath(resolved)))
+		throw new Error(`Ghidra analyzeHeadless not found under ${resolved}`);
+	const version = applicationVersion(resolved);
+	if (!version?.startsWith("12."))
+		throw new Error(
+			`Ghidra 12 is required; found ${version ?? "an unreadable version"} under ${resolved}`,
+		);
+	return resolved;
+}
+
+function scanGhidraRoot(root: string, depth: number, insideMatch = false): string[] {
+	if (depth < 0 || !existsSync(root)) return [];
+	try {
+		const result: string[] = [];
+		const entries = readdirSync(root, { withFileTypes: true }).sort((a, b) =>
+			b.name.localeCompare(a.name, undefined, { numeric: true }),
+		);
+		for (const entry of entries) {
+			if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+			const matched = insideMatch || /ghidra/i.test(entry.name);
+			if (!matched) continue;
+			const path = join(root, entry.name);
+			result.push(path);
+			if (existsSync(launcherPath(path)) && applicationVersion(path)?.startsWith("12.")) continue;
+			result.push(...scanGhidraRoot(path, depth - 1, true));
 		}
-	} else {
-		values.push("/opt/ghidra", "/usr/local/ghidra", join(homedir(), "ghidra"));
+		return result;
+	} catch (error) {
+		if (["EACCES", "ENOENT", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? ""))
+			return [];
+		throw error;
 	}
-	return values.filter((value): value is string => Boolean(value));
+}
+
+function discoveryRoots(): string[] {
+	if (process.platform === "win32") {
+		const user = process.env.USERPROFILE || homedir();
+		const local = process.env.LOCALAPPDATA;
+		return [
+			"C:\\",
+			user,
+			join(user, "Desktop"),
+			join(user, "Downloads"),
+			join(user, "Documents"),
+			join(user, "tools"),
+			join(user, "Applications"),
+			process.env.ProgramFiles,
+			process.env["ProgramFiles(x86)"],
+			process.env.ProgramData && join(process.env.ProgramData, "chocolatey", "lib"),
+			local && join(local, "Programs"),
+			local && join(local, "Microsoft", "WinGet", "Packages"),
+			join(user, "scoop", "apps"),
+		].filter((value): value is string => Boolean(value));
+	}
+	if (process.platform === "darwin") {
+		return [
+			"/Applications",
+			join(homedir(), "Applications"),
+			join(homedir(), "Downloads"),
+			join(homedir(), "Desktop"),
+			join(homedir(), "tools"),
+			"/opt/homebrew/Cellar",
+			"/opt/homebrew/opt",
+			"/usr/local/Cellar",
+			"/usr/share",
+		];
+	}
+	return [
+		"/opt",
+		"/usr/local",
+		"/usr/share",
+		"/snap",
+		join(homedir(), "Downloads"),
+		join(homedir(), "Desktop"),
+		join(homedir(), "tools"),
+		join(homedir(), ".local", "share"),
+		join(homedir(), ".linuxbrew", "Cellar"),
+		join(homedir(), ".linuxbrew", "opt"),
+	];
+}
+
+function automaticGhidraHomes(refresh: boolean): string[] {
+	if (!refresh && automaticHomesCache) return automaticHomesCache;
+	const values = [
+		...(process.platform === "win32"
+			? ["C:\\ghidra_12.1.2"]
+			: ["/opt/ghidra", "/usr/local/ghidra", "/usr/share/ghidra", join(homedir(), "ghidra")]),
+		...discoveryRoots().flatMap((root) => [root, ...scanGhidraRoot(root, 3)]),
+	];
+	const seen = new Set<string>();
+	automaticHomesCache = values
+		.map((value) => resolve(value))
+		.filter((value) => {
+			const key = process.platform === "win32" ? value.toLowerCase() : value;
+			if (seen.has(key)) return false;
+			seen.add(key);
+			return existsSync(launcherPath(value)) && applicationVersion(value)?.startsWith("12.");
+		});
+	return automaticHomesCache;
+}
+
+export function discoverGhidraHomes(refresh = false): string[] {
+	const configured = readableGhidraConfig().ghidraHome;
+	const preferred = [process.env.PI_GHIDRA_HOME, process.env.GHIDRA_HOME, configured].flatMap(
+		(value) => (value ? [resolve(value)] : []),
+	);
+	const seen = new Set<string>();
+	return [...preferred, ...automaticGhidraHomes(refresh)].filter((value) => {
+		const key = process.platform === "win32" ? value.toLowerCase() : value;
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return existsSync(launcherPath(value)) && applicationVersion(value)?.startsWith("12.");
+	});
 }
 
 export function resolveGhidraHome(explicit?: string): string {
-	const home = candidateHomes()
-		.map((candidate) => resolve(candidate))
-		.find((candidate) => {
-			const launcher = join(
-				candidate,
-				"support",
-				process.platform === "win32"
-					? "analyzeHeadless.bat"
-					: "analyzeHeadless",
-			);
-			return (
-				existsSync(launcher) && applicationVersion(candidate)?.startsWith("12.")
-			);
-		});
-	if (explicit) {
-		const resolved = resolve(explicit);
-		const launcher = join(
-			resolved,
-			"support",
-			process.platform === "win32" ? "analyzeHeadless.bat" : "analyzeHeadless",
-		);
-		if (!existsSync(launcher))
-			throw new Error(`Ghidra analyzeHeadless not found under ${resolved}`);
-		const version = applicationVersion(resolved);
-		if (!version?.startsWith("12."))
-			throw new Error(
-				`Ghidra 12 is required; found ${version ?? "an unreadable version"} under ${resolved}`,
-			);
-		return resolved;
+	if (explicit) return validateGhidraHome(explicit);
+	for (const preferred of [process.env.PI_GHIDRA_HOME, process.env.GHIDRA_HOME]) {
+		if (!preferred) continue;
+		const resolved = resolve(preferred);
+		if (existsSync(launcherPath(resolved)) && applicationVersion(resolved)?.startsWith("12."))
+			return resolved;
 	}
+	const configured = readGhidraConfig().ghidraHome;
+	if (configured) {
+		const resolved = resolve(configured);
+		if (existsSync(launcherPath(resolved)) && applicationVersion(resolved)?.startsWith("12."))
+			return resolved;
+	}
+	const home = discoverGhidraHomes()[0];
 	if (!home)
 		throw new Error(
-			"Ghidra 12 was not found. Set PI_GHIDRA_HOME or GHIDRA_HOME.",
+			"Ghidra 12 was not found. Run /ghidra-setup, call ghidra with action=setup, or set PI_GHIDRA_HOME.",
 		);
 	return home;
 }
 
+export function parseJavaMajor(output: string): number | undefined {
+	const match = output.match(/version "(?:1\.)?(\d+)/i);
+	if (!match) return undefined;
+	const major = Number.parseInt(match[1], 10);
+	return Number.isFinite(major) ? major : undefined;
+}
+
+function usableJavaHome(home: string): { home: string; major: number } | undefined {
+	const resolved = resolve(home);
+	const executable = join(resolved, "bin", process.platform === "win32" ? "java.exe" : "java");
+	if (!existsSync(executable)) return undefined;
+	const result = spawnSync(executable, ["-version"], {
+		encoding: "utf8",
+		timeout: 5000,
+		windowsHide: true,
+	});
+	if (result.error || result.status !== 0) return undefined;
+	const major = parseJavaMajor(`${result.stderr ?? ""}\n${result.stdout ?? ""}`);
+	return major === undefined ? undefined : { home: resolved, major };
+}
+
+function validateJavaHome(home: string): string {
+	const java = usableJavaHome(home);
+	if (!java) throw new Error(`A working Java installation was not found under ${resolve(home)}`);
+	if (java.major < 21) throw new Error(`Ghidra 12 requires JDK 21 or newer; found Java ${java.major} under ${java.home}`);
+	return java.home;
+}
+
+export async function saveGhidraConfig(update: GhidraConfig): Promise<GhidraConfig> {
+	let current: GhidraConfig = {};
+	try {
+		current = readGhidraConfig();
+	} catch (error) {
+		if (!update.ghidraHome) throw error;
+	}
+	const next: GhidraConfig = { ...current, ...update };
+	if (update.ghidraHome) next.ghidraHome = validateGhidraHome(update.ghidraHome);
+	if (update.javaHome) next.javaHome = validateJavaHome(update.javaHome);
+	if (update.cacheDir) next.cacheDir = validateCacheDir(update.cacheDir);
+	const path = ghidraConfigPath();
+	const temporary = `${path}.${randomUUID()}.tmp`;
+	await mkdir(dirname(path), { recursive: true });
+	try {
+		await writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+		await renameFile(temporary, path);
+	} finally {
+		await rm(temporary, { force: true });
+	}
+	return next;
+}
+
 function javaHome(): string | undefined {
-	if (
-		process.env.JAVA_HOME &&
-		existsSync(
-			join(
-				process.env.JAVA_HOME,
-				"bin",
-				process.platform === "win32" ? "java.exe" : "java",
-			),
-		)
-	)
-		return process.env.JAVA_HOME;
+	if (process.env.JAVA_HOME) {
+		const java = usableJavaHome(process.env.JAVA_HOME);
+		if (java?.major && java.major >= 21) return java.home;
+	}
+	const configured = readableGhidraConfig().javaHome;
+	if (configured) {
+		const java = usableJavaHome(configured);
+		if (java?.major && java.major >= 21) return java.home;
+	}
 	if (process.platform !== "win32") return undefined;
 	const roots = [
 		join(process.env.ProgramFiles || "C:\\Program Files", "Eclipse Adoptium"),
@@ -224,11 +414,12 @@ function javaHome(): string | undefined {
 	];
 	for (const root of roots) {
 		if (!existsSync(root)) continue;
-		const found = readdirSync(root)
-			.filter((name) => /^jdk/i.test(name))
-			.sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))
-			.find((name) => existsSync(join(root, name, "bin", "java.exe")));
-		if (found) return join(root, found);
+		for (const name of readdirSync(root)
+			.filter((entry) => /^jdk/i.test(entry))
+			.sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))) {
+			const java = usableJavaHome(join(root, name));
+			if (java?.major && java.major >= 21) return java.home;
+		}
 	}
 	return undefined;
 }
@@ -397,10 +588,9 @@ async function launch(
 		);
 	}
 	const fd = openSync(log, "w");
-	const env = {
-		...process.env,
-		JAVA_HOME: javaHome() || process.env.JAVA_HOME,
-	};
+	const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== "JAVA_HOME"));
+	const resolvedJavaHome = javaHome();
+	if (resolvedJavaHome) env.JAVA_HOME = resolvedJavaHome;
 	const child = wrapper
 		? spawn(
 				process.env.ComSpec || "cmd.exe",
@@ -461,6 +651,7 @@ function opFromRequest(request: GhidraRequest): Record<string, unknown> {
 	const {
 		binary: _binary,
 		ghidraHome: _home,
+		javaHome: _java,
 		cacheDir: _cache,
 		force: _force,
 		operations,
@@ -584,32 +775,56 @@ export async function runGhidra(
 	cwd = process.cwd(),
 	signal?: AbortSignal,
 ): Promise<RunResult> {
-	const home = resolveGhidraHome(request.ghidraHome);
+	if (request.action === "discover") {
+		const homes = discoverGhidraHomes(true);
+		return {
+			action: "discover",
+			ghidraHome: homes[0] ?? "",
+			result: {
+				configPath: ghidraConfigPath(),
+				config: readableGhidraConfig(),
+				ghidraHomes: homes.map((home) => ({
+					path: home,
+					version: applicationVersion(home),
+				})),
+			},
+		};
+	}
+	if (request.action === "setup") {
+		const home = resolveGhidraHome(request.ghidraHome ? resolve(cwd, request.ghidraHome) : undefined);
+		const update: GhidraConfig = { ghidraHome: home };
+		if (request.javaHome) update.javaHome = resolve(cwd, request.javaHome);
+		if (request.cacheDir) update.cacheDir = resolve(cwd, request.cacheDir);
+		const config = await saveGhidraConfig(update);
+		return {
+			action: "setup",
+			ghidraHome: home,
+			result: {
+				configured: true,
+				configPath: ghidraConfigPath(),
+				config,
+				version: applicationVersion(home),
+			},
+		};
+	}
+	const home = resolveGhidraHome(request.ghidraHome ? resolve(cwd, request.ghidraHome) : undefined);
 	if (request.action === "health") {
 		return {
 			action: "health",
 			ghidraHome: home,
 			result: {
 				version: applicationVersion(home),
-				javaHome: javaHome() ?? process.env.JAVA_HOME ?? null,
-				cacheDir: resolve(request.cacheDir || defaultCacheDir()),
+				javaHome: javaHome() ?? null,
+				cacheDir: validateCacheDir(request.cacheDir ? resolve(cwd, request.cacheDir) : defaultCacheDir()),
+				configPath: ghidraConfigPath(),
+				config: readableGhidraConfig(),
+				detectedHomes: discoverGhidraHomes(),
 				actions: ACTIONS,
 			},
 		};
 	}
 	const binary = assertBinary(request, cwd);
-	const cacheRoot = resolve(request.cacheDir || defaultCacheDir());
-	const cacheParts = cacheRoot.split(/[\\/]+/);
-	if (cacheParts.some((part) => part.startsWith("."))) {
-		throw new Error(
-			`Ghidra project paths cannot contain dot-prefixed directories: ${cacheRoot}`,
-		);
-	}
-	if (cacheParts.some((part) => /[&%!^]/.test(part))) {
-		throw new Error(
-			`Ghidra project paths cannot contain &, %, !, or ^: ${cacheRoot}`,
-		);
-	}
+	const cacheRoot = validateCacheDir(request.cacheDir ? resolve(cwd, request.cacheDir) : defaultCacheDir());
 	await mkdir(cacheRoot, { recursive: true });
 	const prepared = await prepareArtifact(binary, cacheRoot);
 	return serialized(prepared.hash, async () => {

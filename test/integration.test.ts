@@ -13,8 +13,15 @@ test("real Ghidra headless analysis", {
 	timeout: 20 * 60_000,
 }, async () => {
 	const cacheDir = await mkdtemp(join(tmpdir(), "pi-ghidra-integration-"));
-	const base = { binary, ghidraHome, cacheDir };
+	const oldConfigDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = join(cacheDir, "pi-config");
+	const base = { binary };
 	try {
+		const setup = await runGhidra({ action: "setup", ghidraHome, cacheDir });
+		assert.ok(setup.ghidraHome);
+		const health = await runGhidra({ action: "health" });
+		assert.equal(health.ghidraHome, setup.ghidraHome);
+		assert.ok((health.result as { javaHome: string | null }).javaHome);
 		const imported = await runGhidra({ ...base, action: "info" });
 		const info = imported.result as { functionCount: number; format: string };
 		assert.ok(info.functionCount > 0);
@@ -100,6 +107,8 @@ test("real Ghidra headless analysis", {
 			],
 		});
 	} finally {
+		if (oldConfigDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = oldConfigDir;
 		await rm(cacheDir, { recursive: true, force: true });
 	}
 });

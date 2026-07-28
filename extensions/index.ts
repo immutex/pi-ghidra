@@ -6,10 +6,15 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { formatSize, truncateHead } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
-import { ACTIONS, runGhidra, type GhidraRequest } from "../src/runtime.ts";
+import {
+	ACTIONS,
+	discoverGhidraHomes,
+	runGhidra,
+	type GhidraRequest,
+} from "../src/runtime.ts";
 
 const OPERATION_ACTIONS = ACTIONS.filter(
-	(action) => !["health", "batch", "rebuild"].includes(action),
+	(action) => !["discover", "setup", "health", "batch", "rebuild"].includes(action),
 );
 
 const operationSchema = Type.Object({
@@ -49,7 +54,7 @@ const paramsSchema = Type.Object({
 	binary: Type.Optional(
 		Type.String({
 			description:
-				"Binary path, absolute or relative to Pi's current directory. Required except for health.",
+				"Binary path, absolute or relative to Pi's current directory. Required except for discover, setup, and health.",
 		}),
 	),
 	address: Type.Optional(
@@ -86,7 +91,12 @@ const paramsSchema = Type.Object({
 	ghidraHome: Type.Optional(
 		Type.String({
 			description:
-				"Ghidra install root. Usually auto-detected or set with PI_GHIDRA_HOME.",
+				"Ghidra install root. Auto-detected when omitted; action=setup saves it for future sessions.",
+		}),
+	),
+	javaHome: Type.Optional(
+		Type.String({
+			description: "Optional JDK root to persist with action=setup.",
 		}),
 	),
 	cacheDir: Type.Optional(
@@ -102,14 +112,47 @@ const paramsSchema = Type.Object({
 type Params = Static<typeof paramsSchema>;
 
 export default function ghidraExtension(pi: ExtensionAPI) {
+	pi.registerCommand("ghidra-setup", {
+		description: "Find or configure the local Ghidra 12 installation",
+		handler: async (args, ctx) => {
+			let home = args.trim().replace(/^"(.*)"$/, "$1");
+			if (!home) {
+				const candidates = discoverGhidraHomes(true);
+				if (candidates.length === 1) home = candidates[0];
+				else if (ctx.hasUI) {
+					const manual = "Enter another location...";
+					const selected = candidates.length
+						? await ctx.ui.select("Select Ghidra 12", [...candidates, manual])
+						: manual;
+					if (selected === manual)
+						home = (await ctx.ui.input("Ghidra 12 installation directory"))?.trim() ?? "";
+					else home = selected ?? "";
+				} else {
+					ctx.ui.notify("Usage: /ghidra-setup /path/to/ghidra", "warning");
+					return;
+				}
+			}
+			if (!home) return;
+			try {
+				const result = await runGhidra({ action: "setup", ghidraHome: home }, ctx.cwd, ctx.signal);
+				const details = result.result as { configPath: string; version: string };
+				ctx.ui.notify(`Ghidra ${details.version} configured in ${details.configPath}`, "info");
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			}
+		},
+	});
+
 	pi.registerTool({
 		name: "ghidra",
 		label: "Ghidra",
 		description:
-			"Run autonomous Ghidra 12 headless reverse engineering. Imports and analyzes binaries automatically, caches projects by SHA-256, decompiles functions, queries listings/symbols/xrefs/call graphs/memory, reruns analyzers, and applies renames/comments/patches. Use batch to run up to 50 operations in one JVM. Results are capped at 50KB; use offset/limit for pagination.",
+			"Run autonomous Ghidra 12 headless reverse engineering. Automatically discovers common installations; discover lists candidates and setup persists a chosen path. Imports and analyzes binaries automatically, caches projects by SHA-256, decompiles functions, queries listings/symbols/xrefs/call graphs/memory, reruns analyzers, and applies renames/comments/patches. Use batch to run up to 50 operations in one JVM. Results are capped at 50KB; use offset/limit for pagination.",
 		promptSnippet: "Analyze binaries autonomously with headless Ghidra",
 		promptGuidelines: [
 			"Use ghidra directly for binary analysis; do not ask the user to open Ghidra.",
+			"If Ghidra is not found, use ghidra action=discover, then action=setup with the chosen ghidraHome; setup persists it globally.",
+			"When the user states their Ghidra location, use ghidra action=setup to save it instead of requiring an environment variable.",
 			"Use ghidra with action=batch for related queries to avoid repeated JVM startup.",
 			"Use ghidra action=functions or symbols to discover canonical addresses before decompiling or mutating.",
 		],

@@ -16,7 +16,8 @@ Ghidra is resolved in this order:
 1. `ghidraHome` on a tool call
 2. `PI_GHIDRA_HOME`
 3. `GHIDRA_HOME`
-4. Common install locations, including `C:\ghidra_12.1.2`
+4. The path saved by `/ghidra-setup`
+5. Common install locations, package managers, Downloads, Desktop, and home directories
 
 On Windows, `JAVA_HOME` is used when set. Otherwise common Eclipse Adoptium and Oracle JDK locations are checked automatically.
 
@@ -37,6 +38,30 @@ Try a local checkout:
 ```bash
 pi -e ./pi-ghidra
 ```
+
+## Setup
+
+Usually no setup is needed. The package searches common Ghidra locations on Windows, macOS, and Linux.
+
+If Ghidra is not found, run the interactive setup command:
+
+```text
+/ghidra-setup
+```
+
+You can also provide the path directly:
+
+```text
+/ghidra-setup C:\ghidra_12.1.2
+```
+
+Or tell Pi naturally: “My Ghidra is at `C:\ghidra_12.1.2`.” Pi can call `ghidra` with `action: "setup"` and save the location for every future session. The setup action also accepts optional `javaHome` and `cacheDir` values.
+
+`/ghidra-setup` is interactive in TUI and RPC modes. In print or JSON mode, use the `setup` tool action or an environment variable.
+
+The setting is stored in `~/.pi/agent/pi-ghidra.json`, or under `PI_CODING_AGENT_DIR` when that variable is set. Environment variables and per-call paths remain available for CI and temporary overrides.
+
+Use `ghidra` with `action: "discover"` to list every detected installation and `action: "health"` to show the active Ghidra, JDK, cache, and configuration.
 
 ## Usage
 
@@ -71,6 +96,8 @@ Then decompile an exact function:
 
 | Action | Purpose |
 | --- | --- |
+| `discover` | Find installed Ghidra 12 locations |
+| `setup` | Validate and persist Ghidra, JDK, and cache locations |
 | `health` | Show detected Ghidra, Java, cache, and capabilities |
 | `analyze`, `info` | Import/analyze as needed and return program metadata |
 | `rebuild` | Delete the cached project and analyze from a clean import |
