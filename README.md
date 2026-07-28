@@ -8,18 +8,8 @@ Autonomous, native Ghidra tools for [Pi](https://pi.dev). No GUI, bridge server,
 
 - Pi
 - Ghidra 12.x
-- The JDK required by your Ghidra release
+- JDK 21 or newer
 - Node.js 20+
-
-Ghidra is resolved in this order:
-
-1. `ghidraHome` on a tool call
-2. `PI_GHIDRA_HOME`
-3. `GHIDRA_HOME`
-4. The path saved by `/ghidra-setup`
-5. Common install locations, package managers, Downloads, Desktop, and home directories
-
-On Windows, `JAVA_HOME` is used when set. Otherwise common Eclipse Adoptium and Oracle JDK locations are checked automatically.
 
 ## Install
 
@@ -41,27 +31,35 @@ pi -e ./pi-ghidra
 
 ## Setup
 
-Usually no setup is needed. The package searches common Ghidra locations on Windows, macOS, and Linux.
+No environment variables or manual config file are normally needed. On first use, `pi-ghidra` searches common Windows, macOS, and Linux install locations.
 
-If Ghidra is not found, run the interactive setup command:
+If Ghidra is not found, run:
 
 ```text
 /ghidra-setup
 ```
 
-You can also provide the path directly:
+Select a detected installation, enter a directory, or pass it directly:
 
 ```text
 /ghidra-setup C:\ghidra_12.1.2
 ```
 
-Or tell Pi naturally: “My Ghidra is at `C:\ghidra_12.1.2`.” Pi can call `ghidra` with `action: "setup"` and save the location for every future session. The setup action also accepts optional `javaHome` and `cacheDir` values.
+You can also tell Pi: “My Ghidra is at `C:\ghidra_12.1.2`.” Pi will validate and save it. In print or JSON mode, provide the path through the `setup` tool action instead of using the interactive command.
 
-`/ghidra-setup` is interactive in TUI and RPC modes. In print or JSON mode, use the `setup` tool action or an environment variable.
+Saved settings live in `~/.pi/agent/pi-ghidra.json`, or `PI_CODING_AGENT_DIR/pi-ghidra.json` when that variable is set. The `setup` action can also persist optional `javaHome` and `cacheDir` values.
 
-The setting is stored in `~/.pi/agent/pi-ghidra.json`, or under `PI_CODING_AGENT_DIR` when that variable is set. Environment variables and per-call paths remain available for CI and temporary overrides.
+Ghidra location precedence is:
 
-Use `ghidra` with `action: "discover"` to list every detected installation and `action: "health"` to show the active Ghidra, JDK, cache, and configuration.
+1. Per-call `ghidraHome`
+2. `PI_GHIDRA_HOME`
+3. `GHIDRA_HOME`
+4. Saved setup
+5. Automatic discovery
+
+A working `JAVA_HOME` takes precedence over a saved JDK. On Windows, common Eclipse Adoptium and Oracle JDK locations are also detected. If no JDK home is selected, Ghidra can use Java from `PATH`.
+
+Use `discover` to list detected installations and `health` to show the active Ghidra, JDK, cache, and saved settings.
 
 ## Usage
 
@@ -123,7 +121,7 @@ Projects are content-addressed by the input binary's SHA-256 and serialized per 
 - macOS: `~/Library/Caches/pi-ghidra`
 - Linux: `~/pi-ghidra-cache`
 
-Override with `PI_GHIDRA_CACHE`, `cacheDir`, or both. Ghidra rejects project paths containing dot-prefixed directory components, so avoid paths such as `~/.cache/pi-ghidra`.
+Override per call with `cacheDir`, persist a cache directory through the `setup` action, or set `PI_GHIDRA_CACHE`. Ghidra rejects project paths containing dot-prefixed directory components, so avoid paths such as `~/.cache/pi-ghidra`.
 
 Edits affect only the cached Ghidra project. The source binary is copied and never modified.
 
