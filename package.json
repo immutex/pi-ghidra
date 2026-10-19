@@ -1,7 +1,7 @@
 {
   "name": "pi-ghidra",
-  "version": "0.2.0",
-  "description": "Autonomous headless Ghidra analysis tools for Pi",
+  "version": "0.3.0",
+  "description": "Autonomous headless Ghidra 12 reverse engineering for Pi, omp, and MCP clients: decompile, xrefs, call graphs, strings, memory, and patches without the GUI.",
   "type": "module",
   "license": "MIT",
   "author": "immutex",
@@ -18,17 +18,31 @@
   },
   "keywords": [
     "pi-package",
+    "pi",
+    "omp",
+    "oh-my-pi",
+    "mcp",
+    "mcp-server",
     "ghidra",
+    "ghidra-headless",
     "reverse-engineering",
+    "binary-analysis",
     "decompiler",
-    "headless"
+    "disassembler",
+    "malware-analysis",
+    "firmware",
+    "headless",
+    "ai-agent",
+    "coding-agent"
   ],
   "files": [
     "extensions",
     "src",
+    "mcp",
     "ghidra_scripts",
     "skills",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "pi": {
@@ -39,20 +53,23 @@
       "./skills"
     ]
   },
+  "omp": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "tsx --test test/runtime.test.ts test/extension.test.ts",
+    "test": "tsx --test test/runtime.test.ts test/extension.test.ts test/mcp.test.ts",
     "test:integration": "tsx --test test/integration.test.ts",
     "pack:check": "npm pack --dry-run",
     "prepublishOnly": "npm run check && npm test"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "latest",
     "@earendil-works/pi-coding-agent": "latest",
     "@types/node": "latest",
     "tsx": "latest",
@@ -60,6 +77,6 @@
     "typescript": "latest"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19.0"
   }
 }

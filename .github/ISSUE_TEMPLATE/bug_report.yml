@@ -1,0 +1,83 @@
+name: Bug report
+description: Report a reproducible problem with pi-ghidra
+title: "[bug] "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Do not attach proprietary binaries; use a public sample
+        or describe the binary format and the failing action.
+
+        Security issues belong in GitHub Security Advisories, not here.
+  - type: input
+    id: version
+    attributes:
+      label: pi-ghidra version
+      placeholder: "0.3.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: host
+    attributes:
+      label: Host
+      options:
+        - Pi
+        - omp
+        - MCP client (Command Code, Claude Desktop, other)
+        - Direct runtime call
+    validations:
+      required: true
+  - type: input
+    id: ghidra
+    attributes:
+      label: Ghidra and JDK versions
+      placeholder: "Ghidra 12.1.2, Temurin 25.0.4"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and Node version
+      placeholder: "Windows 11 26200, Node 24.18.0"
+    validations:
+      required: true
+  - type: textarea
+    id: request
+    attributes:
+      label: Request
+      description: The action and arguments, with paths redacted.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result
+      description: Include the error message and the tail of the Ghidra log when available.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Run `...`
+        2. Call action `...`
+        3. Observe `...`
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues for the same problem.
+          required: true
+        - label: This report contains no secrets or proprietary binaries.
+          required: true

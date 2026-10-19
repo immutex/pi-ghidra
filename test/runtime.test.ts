@@ -12,7 +12,10 @@ import {
 	readGhidraConfig,
 	resolveGhidraHome,
 	runGhidra,
+	validateGhidraRequest,
 } from "../src/runtime.ts";
+import { truncateHead, truncateUtf8 } from "../src/text.ts";
+import { TOOL_INPUT_SCHEMA } from "../src/schema.ts";
 
 test("Java version parsing enforces the Ghidra 12 baseline", () => {
 	assert.equal(parseJavaMajor('openjdk version "17.0.12"'), 17);
@@ -111,17 +114,29 @@ test("setup persists and reuses a discovered Ghidra home", async () => {
 		const discovered = await runGhidra({ action: "discover" });
 		assert.equal(discovered.ghidraHome, root);
 		const secondCache = join(root, "cache-2");
-		await runGhidra({ action: "setup", ghidraHome: root, cacheDir: secondCache });
+		await runGhidra({
+			action: "setup",
+			ghidraHome: root,
+			cacheDir: secondCache,
+		});
 		assert.equal(readGhidraConfig().cacheDir, secondCache);
 		await writeFile(ghidraConfigPath(), "{broken json");
 		await runGhidra({ action: "setup", ghidraHome: root });
 		assert.equal(readGhidraConfig().ghidraHome, root);
 		await assert.rejects(
-			runGhidra({ action: "setup", ghidraHome: root, cacheDir: join(root, ".hidden") }),
+			runGhidra({
+				action: "setup",
+				ghidraHome: root,
+				cacheDir: join(root, ".hidden"),
+			}),
 			/dot-prefixed/,
 		);
 		await assert.rejects(
-			runGhidra({ action: "setup", ghidraHome: root, javaHome: join(root, "missing-java") }),
+			runGhidra({
+				action: "setup",
+				ghidraHome: root,
+				javaHome: join(root, "missing-java"),
+			}),
 			/working Java installation/,
 		);
 	} finally {
@@ -187,4 +202,99 @@ test("missing binaries fail before Ghidra starts", async () => {
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
+});
+
+test("requests are validated before any Ghidra process starts", () => {
+	assert.throws(
+		() => validateGhidraRequest({ action: "info" }),
+		/binary is required/,
+	);
+	assert.throws(
+		() =>
+			validateGhidraRequest({
+				action: "info",
+				binary: "sample.exe",
+				nope: true,
+			}),
+		/unknown field "nope"/,
+	);
+	assert.throws(
+		() => validateGhidraRequest({ action: "batch", operations: [] }),
+		/binary is required for batch/,
+	);
+	assert.throws(
+		() =>
+			validateGhidraRequest({
+				action: "batch",
+				binary: "sample.exe",
+				operations: [{ action: "decompile" }],
+			}),
+		/address or name is required/,
+	);
+	assert.throws(
+		() =>
+			validateGhidraRequest({
+				action: "batch",
+				binary: "sample.exe",
+				operations: [{ action: "batch", operations: [] }],
+			}),
+		/unknown field "operations"/,
+	);
+	assert.throws(
+		() => validateGhidraRequest({ action: "rebuild" }),
+		/binary is required for rebuild/,
+	);
+	assert.throws(
+		() => validateGhidraRequest({ action: "health", binary: "x" }),
+		/binary is not valid for health/,
+	);
+	assert.throws(
+		() =>
+			validateGhidraRequest({
+				action: "info",
+				binary: "sample.exe",
+				limit: 5000,
+			}),
+		/limit must be between/,
+	);
+	const batch = validateGhidraRequest({
+		action: "batch",
+		binary: "sample.exe",
+		operations: [
+			{ action: "functions", query: "main" },
+			{ action: "decompile", address: "140001000" },
+		],
+	});
+	assert.equal(batch.operations?.length, 2);
+});
+
+test("output truncation never splits a UTF-8 character", () => {
+	const text = "aaaa\n" + "é".repeat(40);
+	const cut = truncateUtf8(text, 10);
+	assert.equal(cut.truncated, true);
+	assert.ok(!cut.text.includes("\uFFFD"));
+	assert.ok(Buffer.byteLength(cut.text, "utf8") <= 10);
+	const head = truncateHead(text, 64, 100);
+	assert.equal(head.truncated, true);
+	assert.equal(head.totalLines, 2);
+	assert.equal(head.outputLines, 1);
+	assert.equal(head.content, "aaaa");
+	const whole = truncateHead("short", 64, 10);
+	assert.equal(whole.truncated, false);
+	assert.equal(whole.content, "short");
+});
+
+test("the shared schema matches the runtime action surface", () => {
+	const action = TOOL_INPUT_SCHEMA.properties.action;
+	assert.deepEqual([...action.enum], [...ACTIONS]);
+	const operationAction = TOOL_INPUT_SCHEMA.properties.operations.items.properties.action;
+	assert.ok(operationAction.enum.every((value) => ACTIONS.includes(value)));
+	assert.equal(
+		operationAction.enum.length,
+		ACTIONS.length - 5,
+		"batch, discover, health, rebuild, and setup are not operation actions",
+	);
+	assert.equal(TOOL_INPUT_SCHEMA.properties.limit.maximum, 2000);
+	assert.equal(TOOL_INPUT_SCHEMA.properties.length.maximum, 1048576);
+	assert.equal(TOOL_INPUT_SCHEMA.properties.operations.maxItems, 50);
 });

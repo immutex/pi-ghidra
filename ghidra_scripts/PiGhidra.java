@@ -4,9 +4,13 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -49,10 +53,20 @@ import ghidra.program.model.symbol.SymbolIterator;
 import ghidra.program.util.DefinedDataIterator;
 import ghidra.util.exception.CancelledException;
 
+/**
+ * The single Ghidra-side adapter for pi-ghidra.
+ *
+ * Protocol: argv[0] is a JSON request, argv[1] is the JSON response path.
+ * Responses are always written atomically; the script exits non-zero only after
+ * recording a structured error, so the caller can surface it.
+ */
 public class PiGhidra extends GhidraScript {
     private static final int MAX_LIMIT = 2000;
     private static final int MAX_MEMORY = 1024 * 1024;
     private static final long MAX_SEARCH = 64L * 1024 * 1024;
+    private static final int SEARCH_CHUNK = 64 * 1024;
+    private static final int MAX_PATTERN = 1024;
+    private static final char[] HEX = "0123456789abcdef".toCharArray();
     private final Gson gson = new GsonBuilder().disableHtmlEscaping().create();
     private DecompInterface decompiler;
 
@@ -62,16 +76,16 @@ public class PiGhidra extends GhidraScript {
         if (args.length != 2) throw new IllegalArgumentException("Expected request and response paths");
         Path requestPath = Path.of(args[0]);
         Path responsePath = Path.of(args[1]);
-        JsonObject response = new JsonObject();
         try {
             JsonObject request = JsonParser.parseString(Files.readString(requestPath)).getAsJsonObject();
+            JsonObject response = new JsonObject();
             response.addProperty("ok", true);
             response.add("result", execute(request));
             write(responsePath, response);
         } catch (Throwable error) {
-            response = new JsonObject();
+            JsonObject response = new JsonObject();
             response.addProperty("ok", false);
-            response.addProperty("error", error.getClass().getSimpleName() + ": " + String.valueOf(error.getMessage()));
+            response.addProperty("error", describe(error));
             write(responsePath, response);
             if (error instanceof Exception) throw (Exception) error;
             throw new RuntimeException(error);
@@ -80,54 +94,69 @@ public class PiGhidra extends GhidraScript {
         }
     }
 
+    private static String describe(Throwable error) {
+        String message = error.getMessage();
+        return error.getClass().getSimpleName() + (message == null || message.isBlank() ? "" : ": " + message);
+    }
+
     private void write(Path path, JsonObject value) throws IOException {
         Files.createDirectories(path.getParent());
         Path temporary = path.resolveSibling(path.getFileName() + ".tmp");
         Files.writeString(temporary, gson.toJson(value), StandardCharsets.UTF_8);
-        Files.move(temporary, path, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        Files.move(temporary, path, StandardCopyOption.REPLACE_EXISTING);
     }
 
     private JsonElement execute(JsonObject request) throws Exception {
         String action = string(request, "action", true);
-        if ("batch".equals(action)) {
-            JsonArray results = new JsonArray();
-            JsonArray operations = request.getAsJsonArray("operations");
-            if (operations == null || operations.size() == 0) throw new IllegalArgumentException("operations is required for batch");
-            for (JsonElement element : operations) {
-                monitor.checkCancelled();
-                JsonObject operation = element.getAsJsonObject();
-                JsonObject item = new JsonObject();
-                item.addProperty("action", string(operation, "action", true));
-                item.add("result", execute(operation));
-                results.add(item);
-            }
-            return results;
+        switch (action) {
+            case "batch": return batch(request);
+            case "info": return info();
+            case "analyze": return continueAnalysis();
+            case "memory_blocks": return memoryBlocks(request);
+            case "entry_points": return entryPoints(request);
+            case "functions": return functions(request);
+            case "function": return functionJson(resolveFunction(request));
+            case "decompile": return decompile(request);
+            case "disassemble": return disassemble(request);
+            case "data": return data(request);
+            case "strings": return strings(request);
+            case "symbols": return symbols(request);
+            case "imports": return imports(request);
+            case "exports": return exports(request);
+            case "references": return references(request);
+            case "call_graph": return callGraph(request);
+            case "memory": return memory(request);
+            case "search_bytes": return searchBytes(request);
+            case "search_text": return searchText(request);
+            case "analysis_options": return analysisOptions();
+            case "set_analysis_options": return setAnalysisOptions(request);
+            case "reanalyze": return reanalyze();
+            case "rename": return rename(request);
+            case "comment": return comment(request);
+            case "patch": return patch(request);
+            default: throw new IllegalArgumentException("Unknown action: " + action);
         }
-        if ("info".equals(action)) return info();
-        if ("analyze".equals(action)) return continueAnalysis();
-        if ("memory_blocks".equals(action)) return memoryBlocks();
-        if ("entry_points".equals(action)) return entryPoints();
-        if ("functions".equals(action)) return functions(request);
-        if ("function".equals(action)) return functionJson(resolveFunction(request));
-        if ("decompile".equals(action)) return decompile(request);
-        if ("disassemble".equals(action)) return disassemble(request);
-        if ("data".equals(action)) return data(request);
-        if ("strings".equals(action)) return strings(request);
-        if ("symbols".equals(action)) return symbols(request);
-        if ("imports".equals(action)) return imports(request);
-        if ("exports".equals(action)) return exports(request);
-        if ("references".equals(action)) return references(request);
-        if ("call_graph".equals(action)) return callGraph(request);
-        if ("memory".equals(action)) return memory(request);
-        if ("search_bytes".equals(action)) return searchBytes(request);
-        if ("search_text".equals(action)) return searchText(request);
-        if ("analysis_options".equals(action)) return analysisOptions();
-        if ("set_analysis_options".equals(action)) return setAnalysisOptions(request);
-        if ("reanalyze".equals(action)) return reanalyze();
-        if ("rename".equals(action)) return rename(request);
-        if ("comment".equals(action)) return comment(request);
-        if ("patch".equals(action)) return patch(request);
-        throw new IllegalArgumentException("Unknown action: " + action);
+    }
+
+    private JsonArray batch(JsonObject request) throws Exception {
+        JsonElement value = request.get("operations");
+        if (value == null || !value.isJsonArray()) throw new IllegalArgumentException("operations is required for batch");
+        JsonArray operations = value.getAsJsonArray();
+        if (operations.size() == 0) throw new IllegalArgumentException("operations is required for batch");
+        if (operations.size() > 50) throw new IllegalArgumentException("batch accepts at most 50 operations");
+        JsonArray results = new JsonArray();
+        for (JsonElement element : operations) {
+            monitor.checkCancelled();
+            if (!element.isJsonObject()) throw new IllegalArgumentException("batch operations must be objects");
+            JsonObject operation = element.getAsJsonObject();
+            String action = string(operation, "action", true);
+            if ("batch".equals(action)) throw new IllegalArgumentException("batch operations cannot be nested");
+            JsonObject item = new JsonObject();
+            item.addProperty("action", action);
+            item.add("result", execute(operation));
+            results.add(item);
+        }
+        return results;
     }
 
     private JsonObject info() {
@@ -148,9 +177,14 @@ public class PiGhidra extends GhidraScript {
         return result;
     }
 
-    private JsonArray memoryBlocks() {
+    private JsonArray memoryBlocks(JsonObject request) {
+        int offset = integer(request, "offset", 0, 0, Integer.MAX_VALUE);
+        int limit = integer(request, "limit", 200, 1, MAX_LIMIT);
         JsonArray result = new JsonArray();
+        int seen = 0;
         for (MemoryBlock block : currentProgram.getMemory().getBlocks()) {
+            if (seen++ < offset) continue;
+            if (result.size() >= limit) break;
             JsonObject item = new JsonObject();
             item.addProperty("name", block.getName());
             item.addProperty("start", address(block.getStart()));
@@ -166,11 +200,15 @@ public class PiGhidra extends GhidraScript {
         return result;
     }
 
-    private JsonArray entryPoints() {
+    private JsonArray entryPoints(JsonObject request) {
+        int offset = integer(request, "offset", 0, 0, Integer.MAX_VALUE);
+        int limit = integer(request, "limit", 200, 1, MAX_LIMIT);
         JsonArray result = new JsonArray();
+        int seen = 0;
         AddressIterator iterator = currentProgram.getSymbolTable().getExternalEntryPointIterator();
-        while (iterator.hasNext()) {
+        while (iterator.hasNext() && result.size() < limit) {
             Address entry = iterator.next();
+            if (seen++ < offset) continue;
             JsonObject item = new JsonObject();
             item.addProperty("address", address(entry));
             Symbol symbol = currentProgram.getSymbolTable().getPrimarySymbol(entry);
@@ -180,18 +218,45 @@ public class PiGhidra extends GhidraScript {
         return result;
     }
 
+    private JsonArray exports(JsonObject request) throws CancelledException {
+        int offset = integer(request, "offset", 0, 0, Integer.MAX_VALUE);
+        int limit = integer(request, "limit", 200, 1, MAX_LIMIT);
+        JsonArray result = new JsonArray();
+        int seen = 0;
+        AddressIterator iterator = currentProgram.getSymbolTable().getExternalEntryPointIterator();
+        while (iterator.hasNext() && result.size() < limit) {
+            monitor.checkCancelled();
+            Address entry = iterator.next();
+            if (seen++ < offset) continue;
+            JsonObject item = new JsonObject();
+            item.addProperty("address", address(entry));
+            Symbol primary = currentProgram.getSymbolTable().getPrimarySymbol(entry);
+            if (primary != null) {
+                item.addProperty("name", primary.getName(true));
+                item.addProperty("type", primary.getSymbolType().toString());
+                item.addProperty("source", primary.getSource().toString());
+            }
+            JsonArray names = new JsonArray();
+            for (Symbol symbol : currentProgram.getSymbolTable().getSymbols(entry)) {
+                names.add(symbol.getName(true));
+            }
+            item.add("symbols", names);
+            result.add(item);
+        }
+        return result;
+    }
+
     private JsonArray functions(JsonObject request) throws CancelledException {
         int offset = integer(request, "offset", 0, 0, Integer.MAX_VALUE);
         int limit = integer(request, "limit", 200, 1, MAX_LIMIT);
-        String query = string(request, "query", false);
-        query = query == null ? null : query.toLowerCase();
+        String query = lower(string(request, "query", false));
         JsonArray result = new JsonArray();
         int matched = 0;
         FunctionIterator iterator = currentProgram.getFunctionManager().getFunctions(true);
         while (iterator.hasNext() && result.size() < limit) {
             monitor.checkCancelled();
             Function function = iterator.next();
-            if (query != null && !function.getName(true).toLowerCase().contains(query)) continue;
+            if (query != null && !lower(function.getName(true)).contains(query)) continue;
             if (matched++ < offset) continue;
             result.add(functionJson(function));
         }
@@ -237,7 +302,7 @@ public class PiGhidra extends GhidraScript {
             decompiler.toggleSyntaxTree(true);
             if (!decompiler.openProgram(currentProgram)) throw new IllegalStateException(decompiler.getLastMessage());
         }
-        int timeout = integer(request, "timeoutSeconds", 60, 1, 600);
+        int timeout = integer(request, "timeoutSeconds", 60, 1, 900);
         DecompileResults output = decompiler.decompileFunction(function, timeout, monitor);
         if (!output.decompileCompleted()) throw new IllegalStateException(output.getErrorMessage());
         JsonObject result = new JsonObject();
@@ -294,15 +359,16 @@ public class PiGhidra extends GhidraScript {
     private JsonArray strings(JsonObject request) throws CancelledException {
         int offset = integer(request, "offset", 0, 0, Integer.MAX_VALUE);
         int limit = integer(request, "limit", 200, 1, MAX_LIMIT);
-        String query = string(request, "query", false);
-        query = query == null ? null : query.toLowerCase();
+        String query = lower(string(request, "query", false));
         JsonArray result = new JsonArray();
         int matched = 0;
-        for (Data data : DefinedDataIterator.byDataInstance(currentProgram, value -> StringDataInstance.getStringDataInstance(value) != null)) {
+        for (Data data : DefinedDataIterator.byDataInstance(
+                currentProgram, value -> StringDataInstance.getStringDataInstance(value) != null)) {
             monitor.checkCancelled();
             StringDataInstance instance = StringDataInstance.getStringDataInstance(data);
-            String value = instance == null ? data.getDefaultValueRepresentation() : instance.getStringValue();
-            if (value == null || (query != null && !value.toLowerCase().contains(query))) continue;
+            if (instance == null) continue;
+            String value = instance.getStringValue();
+            if (value == null || (query != null && !lower(value).contains(query))) continue;
             if (matched++ < offset) continue;
             JsonObject item = new JsonObject();
             item.addProperty("address", address(data.getAddress()));
@@ -317,15 +383,14 @@ public class PiGhidra extends GhidraScript {
     private JsonArray symbols(JsonObject request) throws CancelledException {
         int offset = integer(request, "offset", 0, 0, Integer.MAX_VALUE);
         int limit = integer(request, "limit", 200, 1, MAX_LIMIT);
-        String query = string(request, "query", false);
-        query = query == null ? null : query.toLowerCase();
+        String query = lower(string(request, "query", false));
         JsonArray result = new JsonArray();
         int matched = 0;
         SymbolIterator iterator = currentProgram.getSymbolTable().getAllSymbols(true);
         while (iterator.hasNext() && result.size() < limit) {
             monitor.checkCancelled();
             Symbol symbol = iterator.next();
-            if (query != null && !symbol.getName(true).toLowerCase().contains(query)) continue;
+            if (query != null && !lower(symbol.getName(true)).contains(query)) continue;
             if (matched++ < offset) continue;
             result.add(symbolJson(symbol));
         }
@@ -364,38 +429,28 @@ public class PiGhidra extends GhidraScript {
         return result;
     }
 
-    private JsonArray exports(JsonObject request) throws CancelledException {
-        int offset = integer(request, "offset", 0, 0, Integer.MAX_VALUE);
-        int limit = integer(request, "limit", 200, 1, MAX_LIMIT);
-        JsonArray result = new JsonArray();
-        int seen = 0;
-        AddressIterator iterator = currentProgram.getSymbolTable().getExternalEntryPointIterator();
-        while (iterator.hasNext() && result.size() < limit) {
-            monitor.checkCancelled();
-            Address value = iterator.next();
-            if (seen++ < offset) continue;
-            JsonObject item = new JsonObject();
-            item.addProperty("address", address(value));
-            Symbol symbol = currentProgram.getSymbolTable().getPrimarySymbol(value);
-            if (symbol != null) item.addProperty("name", symbol.getName(true));
-            result.add(item);
-        }
-        return result;
-    }
-
     private JsonArray references(JsonObject request) throws Exception {
         Address target = resolveAddress(request);
         String direction = string(request, "direction", false);
         direction = direction == null ? "both" : direction;
+        int offset = integer(request, "offset", 0, 0, Integer.MAX_VALUE);
         int limit = integer(request, "limit", 200, 1, MAX_LIMIT);
         JsonArray result = new JsonArray();
+        int seen = 0;
         if (!"from".equals(direction)) {
             ReferenceIterator iterator = currentProgram.getReferenceManager().getReferencesTo(target);
-            while (iterator.hasNext() && result.size() < limit) result.add(referenceJson(iterator.next(), "to"));
+            while (iterator.hasNext() && result.size() < limit) {
+                monitor.checkCancelled();
+                Reference reference = iterator.next();
+                if (seen++ < offset) continue;
+                result.add(referenceJson(reference, "to"));
+            }
         }
         if (!"to".equals(direction)) {
             for (Reference reference : currentProgram.getReferenceManager().getReferencesFrom(target)) {
                 if (result.size() >= limit) break;
+                monitor.checkCancelled();
+                if (seen++ < offset) continue;
                 result.add(referenceJson(reference, "from"));
             }
         }
@@ -415,19 +470,21 @@ public class PiGhidra extends GhidraScript {
 
     private JsonObject callGraph(JsonObject request) throws Exception {
         Function function = resolveFunction(request);
+        int offset = integer(request, "offset", 0, 0, Integer.MAX_VALUE);
         int limit = integer(request, "limit", 200, 1, MAX_LIMIT);
         JsonObject result = new JsonObject();
         result.add("function", functionJson(function));
-        result.add("callers", functionSet(function.getCallingFunctions(monitor), limit));
-        result.add("callees", functionSet(function.getCalledFunctions(monitor), limit));
+        result.add("callers", functionSet(function.getCallingFunctions(monitor), offset, limit));
+        result.add("callees", functionSet(function.getCalledFunctions(monitor), offset, limit));
         return result;
     }
 
-    private JsonArray functionSet(Set<Function> functions, int limit) {
+    private JsonArray functionSet(Set<Function> functions, int offset, int limit) {
+        List<Function> ordered = new ArrayList<>(functions);
+        ordered.sort(Comparator.comparing(Function::getEntryPoint));
         JsonArray result = new JsonArray();
-        for (Function function : functions) {
-            result.add(functionJson(function));
-            if (result.size() >= limit) break;
+        for (int i = offset; i < ordered.size() && result.size() < limit; i++) {
+            result.add(functionJson(ordered.get(i)));
         }
         return result;
     }
@@ -435,72 +492,119 @@ public class PiGhidra extends GhidraScript {
     private JsonObject memory(JsonObject request) throws Exception {
         Address start = resolveAddress(request);
         int length = integer(request, "length", 256, 1, MAX_MEMORY);
-        byte[] bytes = new byte[length];
-        int read = currentProgram.getMemory().getBytes(start, bytes);
-        if (read < bytes.length) bytes = java.util.Arrays.copyOf(bytes, read);
+        byte[] bytes = readBytes(start, length);
         JsonObject result = new JsonObject();
         result.addProperty("address", address(start));
         result.addProperty("length", bytes.length);
+        result.addProperty("truncated", bytes.length < length);
         result.addProperty("hex", hex(bytes));
         result.addProperty("base64", Base64.getEncoder().encodeToString(bytes));
         return result;
     }
 
-    private JsonArray searchBytes(JsonObject request) throws Exception {
-        String pattern = string(request, "pattern", true);
-        return searchPattern(parsePattern(pattern), integer(request, "limit", 100, 1, MAX_LIMIT));
+    /** Read as much of the requested range as the memory map allows. */
+    private byte[] readBytes(Address start, int length) {
+        Memory memory = currentProgram.getMemory();
+        byte[] buffer = new byte[length];
+        int read;
+        try {
+            read = memory.getBytes(start, buffer);
+        } catch (MemoryAccessException error) {
+            read = 0;
+        }
+        if (read == length) return buffer;
+        // Walk byte-by-byte so a hole or uninitialized page yields a partial read.
+        int index = read;
+        while (index < length) {
+            try {
+                buffer[index] = memory.getByte(start.add(index));
+                index++;
+            } catch (MemoryAccessException error) {
+                break;
+            }
+        }
+        return Arrays.copyOf(buffer, index);
     }
 
-    private JsonArray searchText(JsonObject request) throws Exception {
+    private JsonObject searchBytes(JsonObject request) throws Exception {
+        int[] pattern = parsePattern(string(request, "pattern", true));
+        return searchPattern(pattern, integer(request, "limit", 100, 1, MAX_LIMIT));
+    }
+
+    private JsonObject searchText(JsonObject request) throws Exception {
         String query = string(request, "query", true);
         byte[] bytes = query.getBytes(StandardCharsets.UTF_8);
+        if (bytes.length == 0) throw new IllegalArgumentException("query is required for search_text");
+        if (bytes.length > MAX_PATTERN) throw new IllegalArgumentException("query is too long");
         int[] pattern = new int[bytes.length];
         for (int i = 0; i < bytes.length; i++) pattern[i] = bytes[i] & 0xff;
         return searchPattern(pattern, integer(request, "limit", 100, 1, MAX_LIMIT));
     }
 
     private int[] parsePattern(String value) {
-        String[] tokens = value.trim().split("\\s+");
-        if (tokens.length == 0 || tokens.length > 1024) throw new IllegalArgumentException("Invalid byte pattern");
+        String trimmed = value.trim();
+        if (trimmed.isEmpty()) throw new IllegalArgumentException("Byte pattern is empty");
+        String[] tokens = trimmed.split("\\s+");
+        if (tokens.length > MAX_PATTERN) throw new IllegalArgumentException("Byte pattern is too long");
         int[] result = new int[tokens.length];
         for (int i = 0; i < tokens.length; i++) {
-            if ("?".equals(tokens[i]) || "??".equals(tokens[i])) result[i] = -1;
-            else result[i] = Integer.parseInt(tokens[i], 16);
-            if (result[i] > 255) throw new IllegalArgumentException("Invalid byte: " + tokens[i]);
+            String token = tokens[i];
+            if ("?".equals(token) || "??".equals(token)) {
+                result[i] = -1;
+                continue;
+            }
+            String digits = token.startsWith("0x") || token.startsWith("0X") ? token.substring(2) : token;
+            if (digits.length() != 2) throw new IllegalArgumentException("Invalid byte: " + token);
+            try {
+                result[i] = Integer.parseInt(digits, 16);
+            } catch (NumberFormatException error) {
+                throw new IllegalArgumentException("Invalid byte: " + token);
+            }
         }
         return result;
     }
 
-    private JsonArray searchPattern(int[] pattern, int limit) throws Exception {
-        JsonArray result = new JsonArray();
+    private JsonObject searchPattern(int[] pattern, int limit) throws Exception {
+        JsonArray matches = new JsonArray();
         Memory memory = currentProgram.getMemory();
         long scanned = 0;
-        int chunkSize = 64 * 1024;
+        boolean truncated = false;
+        int step = SEARCH_CHUNK - pattern.length + 1;
         for (MemoryBlock block : memory.getBlocks()) {
             if (!block.isInitialized()) continue;
             long blockSize = Math.min(block.getSize(), MAX_SEARCH - scanned);
-            for (long offset = 0; offset < blockSize && result.size() < limit; offset += chunkSize - pattern.length + 1) {
+            for (long offset = 0; offset < blockSize && matches.size() < limit; offset += step) {
                 monitor.checkCancelled();
-                int wanted = (int) Math.min(chunkSize, blockSize - offset);
-                byte[] chunk = new byte[wanted];
-                Address start = block.getStart().add(offset);
-                int count = memory.getBytes(start, chunk);
-                for (int i = 0; i <= count - pattern.length && result.size() < limit; i++) {
+                int wanted = (int) Math.min(SEARCH_CHUNK, blockSize - offset);
+                byte[] chunk = readBytes(block.getStart().add(offset), wanted);
+                for (int i = 0; i <= chunk.length - pattern.length && matches.size() < limit; i++) {
                     boolean match = true;
                     for (int j = 0; j < pattern.length; j++) {
-                        if (pattern[j] >= 0 && (chunk[i + j] & 0xff) != pattern[j]) { match = false; break; }
+                        if (pattern[j] >= 0 && (chunk[i + j] & 0xff) != pattern[j]) {
+                            match = false;
+                            break;
+                        }
                     }
                     if (match) {
                         JsonObject item = new JsonObject();
-                        item.addProperty("address", address(start.add(i)));
-                        result.add(item);
+                        item.addProperty("address", address(block.getStart().add(offset + i)));
+                        matches.add(item);
                     }
                 }
-                scanned += count;
+                scanned += chunk.length;
+                if (chunk.length < wanted) break;
                 if (scanned >= MAX_SEARCH) break;
             }
-            if (result.size() >= limit || scanned >= MAX_SEARCH) break;
+            if (matches.size() >= limit) break;
+            if (scanned >= MAX_SEARCH) {
+                truncated = true;
+                break;
+            }
         }
+        JsonObject result = new JsonObject();
+        result.add("matches", matches);
+        result.addProperty("scannedBytes", scanned);
+        result.addProperty("truncated", truncated);
         return result;
     }
 
@@ -512,19 +616,22 @@ public class PiGhidra extends GhidraScript {
     }
 
     private JsonObject setAnalysisOptions(JsonObject request) {
-        JsonObject requested = request.getAsJsonObject("options");
-        if (requested == null || requested.size() == 0) throw new IllegalArgumentException("options is required");
+        JsonElement value = request.get("options");
+        if (value == null || !value.isJsonObject() || value.getAsJsonObject().size() == 0) {
+            throw new IllegalArgumentException("options is required");
+        }
+        JsonObject requested = value.getAsJsonObject();
         Options options = currentProgram.getOptions(Program.ANALYSIS_PROPERTIES);
         for (Map.Entry<String, JsonElement> entry : requested.entrySet()) {
             if (!options.contains(entry.getKey())) throw new IllegalArgumentException("Unknown analysis option: " + entry.getKey());
             Object current = options.getObject(entry.getKey(), null);
-            String value = entry.getValue().getAsString();
-            if (current instanceof Boolean) options.putObject(entry.getKey(), Boolean.parseBoolean(value));
-            else if (current instanceof Integer) options.putObject(entry.getKey(), Integer.parseInt(value));
-            else if (current instanceof Long) options.putObject(entry.getKey(), Long.parseLong(value));
-            else if (current instanceof Float) options.putObject(entry.getKey(), Float.parseFloat(value));
-            else if (current instanceof Double) options.putObject(entry.getKey(), Double.parseDouble(value));
-            else options.putObject(entry.getKey(), value);
+            String text = entry.getValue().getAsString();
+            if (current instanceof Boolean) options.putObject(entry.getKey(), Boolean.parseBoolean(text));
+            else if (current instanceof Integer) options.putObject(entry.getKey(), Integer.parseInt(text));
+            else if (current instanceof Long) options.putObject(entry.getKey(), Long.parseLong(text));
+            else if (current instanceof Float) options.putObject(entry.getKey(), Float.parseFloat(text));
+            else if (current instanceof Double) options.putObject(entry.getKey(), Double.parseDouble(text));
+            else options.putObject(entry.getKey(), text);
         }
         return analysisOptions();
     }
@@ -571,7 +678,7 @@ public class PiGhidra extends GhidraScript {
         Address address = resolveAddress(request);
         String value = string(request, "value", false);
         String kind = string(request, "commentType", false);
-        CommentType type = CommentType.valueOf(kind == null ? "EOL" : kind);
+        CommentType type = parseCommentType(kind == null ? "EOL" : kind);
         CodeUnit unit = currentProgram.getListing().getCodeUnitContaining(address);
         if (unit == null) throw new IllegalArgumentException("No code or data at " + address);
         String old = unit.getComment(type);
@@ -584,12 +691,25 @@ public class PiGhidra extends GhidraScript {
         return result;
     }
 
+    private CommentType parseCommentType(String value) {
+        try {
+            return CommentType.valueOf(value);
+        } catch (IllegalArgumentException error) {
+            throw new IllegalArgumentException("Invalid commentType: " + value);
+        }
+    }
+
     private JsonObject patch(JsonObject request) throws Exception {
         Address address = resolveAddress(request);
         byte[] bytes = parseHex(string(request, "bytes", true));
         if (bytes.length == 0 || bytes.length > MAX_MEMORY) throw new IllegalArgumentException("Patch must be 1 to " + MAX_MEMORY + " bytes");
         byte[] old = new byte[bytes.length];
-        int read = currentProgram.getMemory().getBytes(address, old);
+        int read = 0;
+        try {
+            read = currentProgram.getMemory().getBytes(address, old);
+        } catch (MemoryAccessException error) {
+            read = 0;
+        }
         if (read != old.length) throw new MemoryAccessException("Could not read complete patch range");
         Address end = address.add(bytes.length - 1L);
         currentProgram.getListing().clearCodeUnits(address, end, false);
@@ -616,19 +736,24 @@ public class PiGhidra extends GhidraScript {
 
     private Function resolveFunction(JsonObject request) throws Exception {
         Function function = tryResolveFunction(request);
-        if (function == null) throw new IllegalArgumentException("Function not found; provide a function name or address");
+        if (function == null) {
+            String name = string(request, "name", false);
+            if (name != null) throw new IllegalArgumentException("Function not found: " + name);
+            throw new IllegalArgumentException("No function at the requested address");
+        }
         return function;
     }
 
     private Function tryResolveFunction(JsonObject request) throws Exception {
         String address = string(request, "address", false);
+        String name = string(request, "name", false);
         if (address != null) {
             Address parsed = parseInputAddress(address);
             Function function = currentProgram.getFunctionManager().getFunctionAt(parsed);
             if (function == null) function = currentProgram.getFunctionManager().getFunctionContaining(parsed);
-            return function;
+            if (function != null) return function;
+            if (name == null) throw new IllegalArgumentException("No function at " + address);
         }
-        String name = string(request, "name", false);
         if (name == null) return null;
         FunctionIterator iterator = currentProgram.getFunctionManager().getFunctions(true);
         while (iterator.hasNext()) {
@@ -665,12 +790,27 @@ public class PiGhidra extends GhidraScript {
         throw new IllegalArgumentException("address or function name is required");
     }
 
-    private Address parseInputAddress(String value) throws Exception {
-        Address result = currentProgram.getAddressFactory().getAddress(value);
-        if (result == null && value.startsWith("0x")) result = currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(value.substring(2));
-        if (result == null && value.matches("[0-9a-fA-F]+")) result = currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(value);
-        if (result == null) throw new IllegalArgumentException("Invalid address: " + value);
-        return result;
+    private Address parseInputAddress(String input) {
+        String value = input.trim();
+        List<String> candidates = new ArrayList<>();
+        candidates.add(value);
+        if (value.startsWith("0x") || value.startsWith("0X")) candidates.add(value.substring(2));
+        if (value.matches("[0-9a-fA-F]+")) candidates.add(value);
+        for (String candidate : candidates) {
+            try {
+                Address parsed = currentProgram.getAddressFactory().getAddress(candidate);
+                if (parsed != null) return parsed;
+            } catch (Exception ignored) {
+                // Try the default address space below.
+            }
+            try {
+                Address parsed = currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(candidate);
+                if (parsed != null) return parsed;
+            } catch (Exception ignored) {
+                // Try the next candidate form.
+            }
+        }
+        throw new IllegalArgumentException("Invalid address: " + input);
     }
 
     private String string(JsonObject object, String key, boolean required) {
@@ -679,6 +819,9 @@ public class PiGhidra extends GhidraScript {
             if (required) throw new IllegalArgumentException(key + " is required");
             return null;
         }
+        if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString()) {
+            throw new IllegalArgumentException(key + " must be a string");
+        }
         String result = value.getAsString();
         if (required && result.isBlank()) throw new IllegalArgumentException(key + " is required");
         return result;
@@ -686,13 +829,26 @@ public class PiGhidra extends GhidraScript {
 
     private int integer(JsonObject object, String key, int fallback, int minimum, int maximum) {
         JsonElement value = object.get(key);
-        int result = value == null || value.isJsonNull() ? fallback : value.getAsInt();
+        int result = fallback;
+        if (value != null && !value.isJsonNull()) {
+            if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()) {
+                throw new IllegalArgumentException(key + " must be an integer");
+            }
+            double number = value.getAsDouble();
+            if (number != Math.rint(number)) throw new IllegalArgumentException(key + " must be an integer");
+            result = value.getAsInt();
+        }
         if (result < minimum || result > maximum) throw new IllegalArgumentException(key + " must be between " + minimum + " and " + maximum);
         return result;
     }
 
     private boolean has(JsonObject object, String key) {
-        return object.has(key) && !object.get(key).isJsonNull();
+        JsonElement value = object.get(key);
+        return value != null && !value.isJsonNull();
+    }
+
+    private static String lower(String value) {
+        return value == null ? null : value.toLowerCase(Locale.ROOT);
     }
 
     private String address(Address value) {
@@ -700,8 +856,12 @@ public class PiGhidra extends GhidraScript {
     }
 
     private String hex(byte[] bytes) {
-        StringBuilder result = new StringBuilder(bytes.length * 2);
-        for (byte value : bytes) result.append(String.format("%02x", value & 0xff));
-        return result.toString();
+        char[] output = new char[bytes.length * 2];
+        for (int i = 0; i < bytes.length; i++) {
+            int value = bytes[i] & 0xff;
+            output[i * 2] = HEX[value >>> 4];
+            output[i * 2 + 1] = HEX[value & 0x0f];
+        }
+        return new String(output);
     }
 }

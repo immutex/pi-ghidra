@@ -1,0 +1,49 @@
+name: Feature request
+description: Propose a new action, host, or workflow
+title: "[feature] "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        pi-ghidra deliberately keeps one Ghidra-side adapter and a small action
+        surface. Explain the workflow the feature unlocks, not only the API you want.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can the agent not do today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: The action name, arguments, and result shape you expect.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Could `batch`, an existing action, or a local script solve this?
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Affected surface
+      options:
+        - New action
+        - Existing action
+        - Pi/omp extension
+        - MCP server
+        - Discovery/setup/cache
+        - Documentation
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues and the README.
+          required: true

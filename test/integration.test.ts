@@ -34,8 +34,8 @@ test("real Ghidra headless analysis", {
 				{ action: "functions", limit: 5 },
 				{ action: "strings", limit: 5 },
 				{ action: "imports", limit: 5 },
-				{ action: "memory_blocks" },
-				{ action: "entry_points" },
+				{ action: "memory_blocks", limit: 2 },
+				{ action: "entry_points", limit: 2 },
 				{ action: "analysis_options" },
 			],
 		});
@@ -43,15 +43,16 @@ test("real Ghidra headless analysis", {
 			action: string;
 			result: unknown;
 		}>;
-		const functions = results[0].result as Array<{
+		const functions = results[0]!.result as Array<{
 			entry: string;
 			name: string;
 		}>;
 		assert.ok(functions.length > 0);
-		assert.ok((results[3].result as unknown[]).length > 0);
+		assert.ok((results[3]!.result as unknown[]).length <= 2);
+		assert.ok((results[4]!.result as unknown[]).length <= 2);
 
-		const entry = functions[0].entry;
-		const name = functions[0].name;
+		const entry = functions[0]!.entry;
+		const name = functions[0]!.name;
 		const inspected = await runGhidra({
 			...base,
 			action: "batch",
@@ -68,9 +69,22 @@ test("real Ghidra headless analysis", {
 			action: string;
 			result: unknown;
 		}>;
-		assert.match((inspectedResults[0].result as { code: string }).code, /\S/);
-		assert.equal((inspectedResults[1].result as unknown[]).length, 5);
-		const bytes = (inspectedResults[4].result as { hex: string }).hex;
+		assert.match((inspectedResults[0]!.result as { code: string }).code, /\S/);
+		assert.equal((inspectedResults[1]!.result as unknown[]).length, 5);
+		const memory = inspectedResults[4]!.result as {
+			hex: string;
+			length: number;
+			truncated: boolean;
+		};
+		assert.equal(memory.length, 8);
+		assert.equal(memory.truncated, false);
+		const bytes = memory.hex;
+		const search = inspectedResults[5]!.result as {
+			matches: Array<{ address: string }>;
+			truncated: boolean;
+		};
+		assert.equal(search.matches.length, 1);
+		assert.equal(search.truncated, false);
 
 		await runGhidra({
 			...base,
