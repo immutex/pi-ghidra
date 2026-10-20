@@ -6,6 +6,16 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-20
+
+### Changed
+
+- Republished with no functional changes. The pi.dev catalog row for `pi-ghidra`
+  lost its download statistics after the 0.3.0 publish, which also removes the
+  package from the catalog listing while its detail page still resolves. A new
+  version rewrites the registry document so the catalog can index it again.
+  Install, discovery, and the tool surface are identical to 0.3.0.
+
 ## [0.3.0] - 2026-10-19
 
 ### Added

@@ -1,6 +1,6 @@
 {
   "name": "pi-ghidra",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Autonomous headless Ghidra 12 reverse engineering for Pi, omp, and MCP clients: decompile, xrefs, call graphs, strings, memory, and patches without the GUI.",
   "type": "module",
   "license": "MIT",
